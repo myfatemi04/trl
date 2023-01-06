@@ -51,9 +51,7 @@ class PPOTrainer(BaseTrainer):
         model: PreTrainedModelWrapper,
         ref_model: PreTrainedModelWrapper,
         tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast],
-        dataset: Union[torch.utils.data.Dataset, Dataset],
         optimizer: Optional[torch.optim.Optimizer] = None,
-        data_collator=None,
         num_shared_layers: Optional[int] = None,
     ):
         """
@@ -105,20 +103,7 @@ class PPOTrainer(BaseTrainer):
                 f"ref_model must be a PreTrainedModelWrapper or `None`, got {type(ref_model)} - supported architectures are: {SUPPORTED_ARCHITECTURES}"
             )
 
-        if not (isinstance(tokenizer, PreTrainedTokenizer) or isinstance(tokenizer, PreTrainedTokenizerFast)):
-            raise ValueError(
-                "tokenizer must be a transformers.PreTrainedTokenizer or transformers.PreTrainedTokenizerFast"
-            )
-        self.tokenizer = tokenizer
-
-        if not (isinstance(dataset, torch.utils.data.Dataset) or isinstance(dataset, Dataset)):
-            raise ValueError("dataloader must be a torch.utils.data.Dataset or datasets.Dataset")
-        self.dataset = dataset
-        self._signature_columns = None
-        self.dataloader = self.prepare_dataloader(self.dataset, data_collator)
-
-        # Step 3: Initialize optimizer and data collator
-        self.data_collator = DataCollatorForLanguageModeling(self.tokenizer, mlm=False)
+        self.data_collator = DataCollatorForLanguageModeling(tokenizer, mlm=False)
         if optimizer is None:
             self.optimizer = Adam(self.model.parameters(), lr=self.config.learning_rate)
         else:
@@ -129,8 +114,8 @@ class PPOTrainer(BaseTrainer):
         else:
             self.kl_ctl = FixedKLController(self.config.init_kl_coef)
 
-        self.model, self.ref_model, self.optimizer, self.data_collator, self.dataloader = self.accelerator.prepare(
-            self.model, self.ref_model, self.optimizer, self.data_collator, self.dataloader
+        self.model, self.ref_model, self.optimizer, self.data_collator = self.accelerator.prepare(
+            self.model, self.ref_model, self.optimizer, self.data_collator
         )
 
         # In a distributed setup, only logging needs to be performed on the main process
@@ -154,59 +139,6 @@ class PPOTrainer(BaseTrainer):
                 Target function
         """
         return {k: v for k, v in kwargs.items() if k in inspect.signature(target_func).parameters.keys()}
-
-    def prepare_dataloader(self, dataset: Union[torch.utils.data.Dataset, Dataset], data_collator=None):
-        """
-        Prepare the dataloader for training.
-
-        Args:
-            dataset (Union[`torch.utils.data.Dataset`, `datasets.Dataset`]):
-                PyTorch dataset or Hugging Face dataset. If a Hugging Face dataset is passed, the dataset
-                will be preprocessed by removing the columns that are not used by the model.
-            data_collator (Optional[function]):
-                Data collator function.
-
-        Returns:
-            `torch.utils.data.DataLoader`:
-                PyTorch dataloader
-        """
-        if isinstance(dataset, Dataset):
-            dataset = self._remove_unused_columns(dataset)
-        dataloader = torch.utils.data.DataLoader(
-            dataset,
-            batch_size=self.config.batch_size,
-            collate_fn=data_collator,
-            shuffle=True,
-        )
-        return dataloader
-
-    # Adapted from transformers.Trainer._set_signature_columns_if_needed
-    def _set_signature_columns_if_needed(self):
-        if self._signature_columns is None:
-            # Inspect model forward signature to keep only the arguments it accepts.
-            signature = inspect.signature(self.model.forward)
-            self._signature_columns = list(signature.parameters.keys())
-            # label => sentiment | we need query and response for logging purpose
-            self._signature_columns += list(set(["label", "query", "response"]))
-
-    # Adapted from transformers.Trainer._remove_unused_columns
-    def _remove_unused_columns(self, dataset: "Dataset"):
-        if not self.config.remove_unused_columns:
-            return dataset
-        self._set_signature_columns_if_needed()
-        signature_columns = self._signature_columns
-
-        ignored_columns = list(set(dataset.column_names) - set(signature_columns))
-
-        columns = [k for k in signature_columns if k in dataset.column_names]
-
-        if version.parse(datasets.__version__) < version.parse("1.4.0"):
-            dataset.set_format(
-                type=dataset.format["type"], columns=columns, format_kwargs=dataset.format["format_kwargs"]
-            )
-            return dataset
-        else:
-            return dataset.remove_columns(ignored_columns)
 
     def generate(self, query_tensor: torch.Tensor, **generation_kwargs):
         """
