@@ -230,17 +230,22 @@ class PPOTrainer(BaseTrainer):
         """
 
         bs = self.config.batch_size
-
+        
+        # Verify the inputs
         queries, responses, scores = self._step_safety_checker(bs, queries, responses, scores)
 
         timing = dict()
         t0 = time.time()
 
+        # Given the queries and responses, get:
+        # Log probabilities of the actions taken
+        # Log probabilities for the reference model
+        # Predicted values for the actions taken
         t = time.time()
-
         logprobs, ref_logprobs, values = self.batched_forward_pass(queries, responses)
         timing["time/ppo/forward_pass"] = time.time() - t
 
+        # Gets the rewards (including KL penalty for diverging from reference log probs)
         t = time.time()
         rewards, non_score_reward = self.compute_rewards(scores, logprobs, ref_logprobs)
         timing["time/ppo/compute_rewards"] = time.time() - t
@@ -252,6 +257,9 @@ class PPOTrainer(BaseTrainer):
             random.shuffle(idxs)
             for i in range(bs):
                 idx = idxs[i]
+                # Train a minibatch. This takes in the logprobs of the actions taken,
+                # the predicted values of those actions, the rewards of those actions,
+                # the queries, and the responses.
                 train_stats = self.train_minibatch(
                     logprobs[idx].unsqueeze(0),
                     values[idx].unsqueeze(0),
@@ -343,16 +351,22 @@ class PPOTrainer(BaseTrainer):
         all_values = []
 
         for i in range(int(bs / fbs)):
+            # Get queries and responses separately
             query_batch = queries[i * fbs : (i + 1) * fbs]
             response_batch = responses[i * fbs : (i + 1) * fbs]
+            # Get query-response strings
             input_ids = self.data_collator([torch.cat([q, r]) for q, r in zip(query_batch, response_batch)])[
                 "input_ids"
             ]
             with torch.no_grad():
                 logits, _, v = self.model(input_ids)
                 ref_logits, _, _ = self.ref_model(input_ids)
+                
+            # Log probs from everything
             logprobs = logprobs_from_logits(logits[:, :-1, :], input_ids[:, 1:])
             ref_logprobs = logprobs_from_logits(ref_logits[:, :-1, :], input_ids[:, 1:])
+            
+            # Log probs just for the action that was taken
             for j in range(fbs):
                 start = len(query_batch[j]) - 1
                 end = len(query_batch[j]) + len(response_batch[j]) - 1
@@ -391,6 +405,7 @@ class PPOTrainer(BaseTrainer):
             train_stats (dict[str, `torch.Tensor`]):
                 Dictionary of training statistics
         """
+        # Find the loss and then optimize. Also record some statistics.
         loss_p, loss_v, train_stats = self.loss(logprobs, values, rewards, query, response, model_input)
         loss = loss_p + loss_v
         self.optimizer.zero_grad()
@@ -412,6 +427,11 @@ class PPOTrainer(BaseTrainer):
             ref_logprobs (`torch.FloatTensor`):
                 Log probabilities of the reference model, shape (`batch_size`, `response_length`)
         """
+        
+        # There is a KL penalty in the *reward* (not the loss). This is controlled by a hyperparam.
+        # The KL penalty reward is intrinsic to *each action*, and the score of the completion
+        # is intrinsic to the *entire sequence*. Therefore, the completion reward is only added to
+        # the end.
         rewards, non_score_rewards = [], []
         for score, logprob, ref_logprob in zip(scores, logprobs, ref_logprobs):
             kl = logprob - ref_logprob
@@ -448,50 +468,76 @@ class PPOTrainer(BaseTrainer):
             model_input (`torch.LongTensor`):
                 Concatenated queries and responses, shape (`batch_size`, `query_length+response_length`)
         """
+        
+        # Generalized Advantage Estimation
+        # Lambda is a smoothing parameter (usually 0.95)
+        # Gamma is the discount factor (in LLMs, this is 1.00)
         lastgaelam = 0
         advantages_reversed = []
         gen_len = response.shape[1]
 
         for t in reversed(range(gen_len)):
             nextvalues = values[:, t + 1] if t < gen_len - 1 else 0.0
-            delta = rewards[:, t] + self.config.gamma * nextvalues - values[:, t]
+            # Deviation from true reward. Takes [current reward + discounted future reward (gamma * next)] and
+            # compares it to the predicted value. This is the predicted *advantage*.
+            delta = (rewards[:, t] + self.config.gamma * nextvalues) - values[:, t]
+            # Deviation from true reward as an EMA (gamma * lambda * delta2 + delta1)
             lastgaelam = delta + self.config.gamma * self.config.lam * lastgaelam
             advantages_reversed.append(lastgaelam)
         advantages = torch.stack(advantages_reversed[::-1]).transpose(0, 1)
 
+        # Total returns
         returns = advantages + values
+        # Advantages are detached and not used for differentiation
         advantages = whiten(advantages)
         advantages = advantages.detach()
 
+        # Calculate logits and value predictions again
         logits, _, vpred = self.model(model_input)
         logprob = logprobs_from_logits(logits[:, :-1, :], model_input[:, 1:])
 
-        # only the generation part of the values/logprobs is needed
+        # Only take the values and logprobs for what was generated, not what was provided
+        # (don't treat the query as an action that was taken by the model)
         logprob, vpred = logprob[:, -gen_len:], vpred[:, -gen_len - 1 : -1]
 
+        # Deviation of predicted values from true values is clipped by cliprange_value
         vpredclipped = clip_by_value(vpred, values - self.config.cliprange_value, values + self.config.cliprange_value)
 
+        # MSE loss for difference between predicted values and actual returns
         vf_losses1 = (vpred - returns) ** 2
+        # MSE loss for difference between predicted values (clipped) and actual returns
         vf_losses2 = (vpredclipped - returns) ** 2
+        # For each token, take the maximum of the two losses (clipped or unclipped). Then,
+        # average across the tokens.
         vf_loss = 0.5 * torch.mean(torch.max(vf_losses1, vf_losses2))
         vf_clipfrac = torch.mean(torch.gt(vf_losses2, vf_losses1).double())
 
+        # Ratio between probabilities. old_logprobs are the *reference* probabilities.
         ratio = torch.exp(logprob - old_logprobs)
 
+        # Policy gradient loss with clipping
         pg_losses = -advantages * ratio
         pg_losses2 = -advantages * torch.clamp(ratio, 1.0 - self.config.cliprange, 1.0 + self.config.cliprange)
 
+        # Mean across tokens
         pg_loss = torch.mean(torch.max(pg_losses, pg_losses2))
+        # Tracking how many were clipped
         pg_clipfrac = torch.mean(torch.gt(pg_losses2, pg_losses).double())
 
+        # Final loss
         loss = pg_loss + self.config.vf_coef * vf_loss
 
+        # Entropy
         entropy = torch.mean(entropy_from_logits(logits))
+        # Approximate KL divergence (?)
         approxkl = 0.5 * torch.mean((logprob - old_logprobs) ** 2)
+        # Policy KL divergence
         policykl = torch.mean(logprob - old_logprobs)
+        # Mean and variance of returns and values
         return_mean, return_var = torch.mean(returns), torch.var(returns)
         value_mean, value_var = torch.mean(values), torch.var(values)
-
+        
+        # This loss doesn't include entropy; entropy is instead included in the reward.
         stats = dict(
             loss=dict(policy=pg_loss, value=vf_loss, total=loss),
             policy=dict(
